@@ -1,0 +1,6 @@
+.env
+venv/
+*.pyc
+
+# ignore stored cookies
+cookies.json
