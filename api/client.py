@@ -4,7 +4,7 @@ import os
 import re
 from getpass import getpass
 from pprint import pprint
-from typing import Union
+from typing import Optional, TypedDict, Union
 from urllib.parse import urljoin
 
 import requests
@@ -14,6 +14,14 @@ from rich.prompt import Prompt
 from rich.status import Status
 
 BASE_URL = "https://www.gradescope.com"
+CSRF_TOKEN_HEADER = "X-Csrf-Token"
+
+
+class GradeTableRow(TypedDict):
+    name: str
+    email: str
+    score: Optional[float]
+    submission: Optional[str]
 
 
 class GradescopeAPI:
@@ -177,11 +185,133 @@ class GradescopeAPI:
 
         # get the csrf token
         csrf_token_meta = page.find("meta", {"name": "csrf-token"})
-        csrf_token = csrf_token_meta["content"]
         csrf_field_meta = page.find("meta", {"name": "csrf-param"})
+        assert csrf_token_meta is not None, "<meta> tag for csrf token not found"
+        assert csrf_field_meta is not None, "<meta> tag for csrf parameter not found"
+        csrf_token = csrf_token_meta["content"]
         csrf_field = csrf_field_meta["content"]
 
         return json.loads(roster_data), (csrf_field, csrf_token)
+
+    def fetch_grades_data(
+        self, course_id: int, assignment_id: int
+    ) -> list[GradeTableRow]:
+        """
+        Fetch grade data on the "review grades" page.
+        """
+        grades_url = urljoin(
+            BASE_URL, f"courses/{course_id}/assignments/{assignment_id}/review_grades"
+        )
+        response = self.session.get(grades_url)
+
+        page = BeautifulSoup(response.content, "html.parser")
+
+        grades_table = page.select_one("table.js-reviewGradesTable")
+        assert grades_table is not None, "Grade table not found"
+
+        # get the header to see which indices we need to look at
+        table_header = grades_table.select("thead th")
+
+        name_idx = -1
+        email_idx = -1
+        score_idx = -1
+        # overwrite index values
+        for col_idx, header_item in enumerate(table_header):
+            if "name" in header_item.text.lower():
+                name_idx = col_idx
+            elif "email" in header_item.text.lower():
+                email_idx = col_idx
+            elif "score" in header_item.text.lower():
+                score_idx = col_idx
+
+        if name_idx < 0 or email_idx < 0 or score_idx < 0:
+            raise RuntimeError(
+                "Unable to find one of name, email, or score columns in the grades table"
+            )
+
+        # iterate through each row in the table, extracting the necessary information
+        table_data = []
+        for table_row in grades_table.select("tbody tr"):
+            row_elements = table_row.select("td")
+
+            name = row_elements[name_idx].text
+            email = row_elements[email_idx].text
+            score = row_elements[score_idx].text
+
+            submission_link_tag = row_elements[name_idx].select_one("a")
+
+            if submission_link_tag is None:
+                # no submission for the student
+                table_data.append(
+                    {"name": name, "email": email, "score": None, "submission": None}
+                )
+            else:
+                submission_link = submission_link_tag.get("href")
+
+                table_data.append(
+                    {
+                        "name": name,
+                        "email": email,
+                        "score": float(score),
+                        "submission": submission_link,
+                    }
+                )
+
+        return table_data
+
+    def fetch_autograder_submission_status(
+        self, course_id: int, assignment_id: int, submission_id: int
+    ):
+        submission_url = urljoin(
+            BASE_URL,
+            f"courses/{course_id}/assignments/{assignment_id}/submissions/{submission_id}",
+        )
+        response = self.session.get(submission_url)
+
+        page = BeautifulSoup(response.content, "html.parser")
+
+        # get the csrf token
+        csrf_token_meta = page.find("meta", {"name": "csrf-token"})
+        csrf_field_meta = page.find("meta", {"name": "csrf-param"})
+        assert csrf_token_meta is not None, "<meta> tag for csrf token not found"
+        assert csrf_field_meta is not None, "<meta> tag for csrf parameter not found"
+        csrf_token = csrf_token_meta.get("content")
+        csrf_field = csrf_field_meta.get("content")
+
+        submission_viewer = page.select_one(
+            'div[data-react-class="AssignmentSubmissionViewer"]'
+        )
+        assert submission_viewer is not None, "Cannot find submission viewer"
+        props_str = submission_viewer.get("data-react-props")
+        assert (
+            props_str is not None
+        ), "Submission viewer component doesn't have data-react-props attr"
+        props_json = json.loads(props_str)
+
+        submission_metadata = props_json["assignment_submission"]
+        autograder_results = props_json["autograder_results"]
+
+        return {
+            "metadata": submission_metadata,
+            "autograder_results": autograder_results,
+            "csrf": (csrf_field, csrf_token),
+        }
+
+    def autograder_regrade_submission(
+        self, course_id: int, assignment_id: int, submission_id: int, csrf_token: str
+    ) -> None:
+        regrade_url = urljoin(
+            BASE_URL,
+            f"courses/{course_id}/assignments/{assignment_id}/submissions/{submission_id}/regrade",
+        )
+        response = self.session.post(
+            regrade_url, headers={CSRF_TOKEN_HEADER: csrf_token}
+        )
+
+        if not response.ok:
+            raise RuntimeError(
+                f"Bad response when regrading submission id {submission_id} (course {course_id}, assignment {assignment_id})"
+            )
 
     def upload(
         self,
@@ -190,7 +320,7 @@ class GradescopeAPI:
         user_id: Union[str, int],
         file_content: str = "",
         filename: str = "upload.txt",
-        csrf_data: tuple[str, str] = None,
+        csrf_data: Optional[tuple[str, str]] = None,
     ):
         """
         Upload a file for a user in a given course and assignment.
@@ -200,7 +330,9 @@ class GradescopeAPI:
         )
 
         if csrf_data is None:
-            _, csrf_data = self.fetch_submission_page_data(course_id, assignment_id)
+            _, csrf_data = self.fetch_submission_page_data(
+                int(course_id), int(assignment_id)
+            )
 
         csrf_field, csrf_token = csrf_data
 
@@ -214,6 +346,7 @@ class GradescopeAPI:
         response = self.session.post(submissions_url, data=data, files=files)
         if not response.ok:
             raise RuntimeError(
-                f"Failed to upload file; (status {response.status_code})\nResponse: {response.content}"
+                f"Failed to upload file; (status {response.status_code})\n"
+                f"Response: {response.content}"
             )
         return True
