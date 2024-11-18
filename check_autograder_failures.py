@@ -20,6 +20,8 @@ def validate_and_fix_submission(
     # for logging purposes
     name: str,
     email: str,
+    # options
+    dry_run=False,
 ) -> bool:
     """
     Fetch a submission's status, and if the autograder failed,
@@ -46,18 +48,25 @@ def validate_and_fix_submission(
         # be conservative and still regrade
         CONSOLE.print(f"[violet]{metadata['status']}: {name} ({email})[/violet]")
 
-    CONSOLE.print("\t[italic red]Regrading submission...[/italic red]")
+    if dry_run:
+        CONSOLE.print(
+            "\t[italic red]Dry run: Submission would be regraded[/italic red]"
+        )
+    else:
+        CONSOLE.print("\t[italic red]Regrading submission...[/italic red]")
 
-    (_, csrf_token) = autograder_output["csrf"]
+        (_, csrf_token) = autograder_output["csrf"]
 
-    api.autograder_regrade_submission(
-        course_id, assignment_id, submission_id, csrf_token
-    )
+        api.autograder_regrade_submission(
+            course_id, assignment_id, submission_id, csrf_token
+        )
 
     return False
 
 
-def main(course_id: int, assignment_id: int, cookie_file="cookies.json"):
+def main(course_id: int, assignment_id: int, cookie_file="cookies.json", dry_run=False):
+    if dry_run:
+        CONSOLE.print("[green]DRY RUN - NO REGRADES WILL BE SENT[/green]")
     api = GradescopeAPI(cookie_file=cookie_file)
 
     grade_data = api.fetch_grades_data(course_id, assignment_id)
@@ -99,14 +108,20 @@ def main(course_id: int, assignment_id: int, cookie_file="cookies.json"):
         ):
             submission_id, name, email = submission_data
             validated = validate_and_fix_submission(
-                api, course_id, assignment_id, submission_id, name, email
+                api,
+                course_id,
+                assignment_id,
+                submission_id,
+                name,
+                email,
+                dry_run=dry_run,
             )
 
             if not validated:
                 next_submissions_to_validate.append(submission_data)
 
         submissions_to_validate = next_submissions_to_validate
-        if len(submissions_to_validate) > 0:
+        if len(submissions_to_validate) > 0 and not dry_run:
             with Progress(
                 # columns
                 "[progress.description]{task.description}",
@@ -123,6 +138,10 @@ def main(course_id: int, assignment_id: int, cookie_file="cookies.json"):
                     time.sleep(1)
                     progress.advance(timer_task)
 
+        if dry_run:
+            # don't loop if we're doing a dry run
+            break
+
 
 if __name__ == "__main__":
     import argparse
@@ -136,5 +155,12 @@ if __name__ == "__main__":
         "--cookies", default="cookies.json", help="Filename for the cookie cache"
     )
 
+    parser.add_argument(
+        "--dry-run",
+        "-n",
+        help="Dry run; does not submit any requests to regrade submissions, and only prints out the submissions that would be regraded",
+        action="store_true",
+    )
+
     args = parser.parse_args()
-    main(args.course_id, args.assignment_id)
+    main(args.course_id, args.assignment_id, dry_run=args.dry_run)
