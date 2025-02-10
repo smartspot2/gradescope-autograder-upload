@@ -88,6 +88,10 @@ class GradescopeAPI:
                 # form does not show, so stop and return
                 return True
 
+        # at this point, the user is not logged in, so we need to log-in the user;
+        # this means that the old cookies were invalid, and should be removed
+        self.session.cookies.clear()
+
         if email is None:
             # ask for email
             email = Prompt.ask("Gradescope email")
