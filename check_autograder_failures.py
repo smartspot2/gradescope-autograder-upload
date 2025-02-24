@@ -1,8 +1,15 @@
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TimeElapsedColumn, track
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from api.client import GradescopeAPI
 
@@ -22,6 +29,7 @@ def validate_and_fix_submission(
     email: str,
     # options
     dry_run=False,
+    verbose=False,
 ) -> bool:
     """
     Fetch a submission's status, and if the autograder failed,
@@ -38,7 +46,8 @@ def validate_and_fix_submission(
     metadata = autograder_output["metadata"]
 
     if metadata["status"] == "processed":
-        CONSOLE.print(f"[green]processed: {name} ({email})[/green]")
+        if verbose:
+            CONSOLE.print(f"[green]processed: {name} ({email})[/green]")
         return True
 
     if metadata["status"] == "failed":
@@ -64,22 +73,34 @@ def validate_and_fix_submission(
     return False
 
 
-def main(course_id: int, assignment_id: int, cookie_file="cookies.json", dry_run=False):
+def main(
+    course_id: int,
+    assignment_id: int,
+    cookie_file="cookies.json",
+    only_check_zero=False,
+    max_workers=8,
+    dry_run=False,
+    verbose=False,
+):
     if dry_run:
         CONSOLE.print("[green]DRY RUN - NO REGRADES WILL BE SENT[/green]")
     api = GradescopeAPI(cookie_file=cookie_file)
 
     grade_data = api.fetch_grades_data(course_id, assignment_id)
 
-    # filter only for submissions that got 0's
-    zero_scores = [
-        row for row in grade_data if row["score"] is not None and row["score"] == 0
-    ]
+    if only_check_zero:
+        # filter only for submissions that got 0's
+        filtered_rows = [
+            row for row in grade_data if row["score"] is not None and row["score"] == 0
+        ]
+    else:
+        # don't do any filtering
+        filtered_rows = grade_data
 
     submissions_to_validate = []
 
     i = 0
-    for table_row in zero_scores:
+    for table_row in filtered_rows:
         i += 1
         if table_row["submission"] is None:
             # no submission associated
@@ -100,25 +121,59 @@ def main(course_id: int, assignment_id: int, cookie_file="cookies.json", dry_run
 
     while len(submissions_to_validate) > 0:
         next_submissions_to_validate = []
-        for submission_data in track(
-            submissions_to_validate,
-            description="Validating submissions...",
+        with Progress(
+            # columns
+            "[progress.description]{task.description}",
+            BarColumn(),
+            MofNCompleteColumn(),
+            "|",
+            TimeRemainingColumn(),
+            # options
             transient=True,
             console=CONSOLE,
-        ):
-            submission_id, name, email = submission_data
-            validated = validate_and_fix_submission(
-                api,
-                course_id,
-                assignment_id,
-                submission_id,
-                name,
-                email,
-                dry_run=dry_run,
+        ) as progress, ProcessPoolExecutor(max_workers) as pool:
+            future_map = {}
+            futures = []
+            for submission_data in submissions_to_validate:
+                (submission_id, name, email) = submission_data
+                future = pool.submit(
+                    validate_and_fix_submission,
+                    api,
+                    course_id,
+                    assignment_id,
+                    submission_id,
+                    name,
+                    email,
+                    dry_run=dry_run,
+                    verbose=verbose,
+                )
+                futures.append(future)
+
+                # save data for reference upon completion
+                future_map[future] = submission_data
+
+            validation_task = progress.add_task(
+                "Validating submissions...", total=len(submissions_to_validate)
             )
 
-            if not validated:
-                next_submissions_to_validate.append(submission_data)
+            for future in as_completed(futures):
+                progress.advance(validation_task)
+                validated = future.result(0)
+
+                if not validated:
+                    submission_data = future_map[future]
+                    next_submissions_to_validate.append(submission_data)
+
+        num_failed = 0
+        num_to_validate = len(submissions_to_validate)
+        if num_failed > 0:
+            CONSOLE.print(
+                f"[red]{num_failed}/{num_to_validate}[/red] [blue]submissions failed.[/blue]"
+            )
+        else:
+            CONSOLE.print(
+                f"[green]All {num_to_validate} submissions succeeded![/green]"
+            )
 
         submissions_to_validate = next_submissions_to_validate
         if len(submissions_to_validate) > 0 and not dry_run:
@@ -156,11 +211,33 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--parallel",
+        type=int,
+        default=8,
+        help="Number of processes to use when sending requests",
+    )
+
+    parser.add_argument(
+        "--only-zero",
+        action="store_true",
+        help="Whether to only check submissions that got a score of zero",
+    )
+
+    parser.add_argument(
         "--dry-run",
         "-n",
         help="Dry run; does not submit any requests to regrade submissions, and only prints out the submissions that would be regraded",
         action="store_true",
     )
 
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+
     args = parser.parse_args()
-    main(args.course_id, args.assignment_id, dry_run=args.dry_run)
+    main(
+        args.course_id,
+        args.assignment_id,
+        only_check_zero=args.only_zero,
+        max_workers=args.parallel,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
