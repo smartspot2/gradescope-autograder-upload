@@ -164,7 +164,7 @@ def main(
                     submission_data = future_map[future]
                     next_submissions_to_validate.append(submission_data)
 
-        num_failed = 0
+        num_failed = len(next_submissions_to_validate)
         num_to_validate = len(submissions_to_validate)
         if num_failed > 0:
             CONSOLE.print(
